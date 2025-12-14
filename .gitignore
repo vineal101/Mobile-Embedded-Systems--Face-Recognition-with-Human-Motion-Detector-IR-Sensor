@@ -6,6 +6,7 @@ __pycache__/
 # C extensions
 *.so
 
+authorized_embedding.npy
 # Distribution / packaging
 .Python
 build/
