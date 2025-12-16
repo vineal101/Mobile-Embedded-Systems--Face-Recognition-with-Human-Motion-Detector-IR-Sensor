@@ -7,8 +7,6 @@ __pycache__/
 *.so
 
 authorized_embedding.npy
-data/
-models/
 # Distribution / packaging
 .Python
 build/
