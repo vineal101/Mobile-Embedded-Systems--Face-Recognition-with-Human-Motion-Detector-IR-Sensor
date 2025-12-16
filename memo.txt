@@ -1,97 +1,69 @@
-Project Memo: Detailed Code Analysis and System Structure
-Date: December 16, 2025
-Platform: Optimized for Raspberry Pi 4 (RPi 4)
-
 1. Overall System Architecture and Structure
 
 The system is organized into three distinct layers to ensure efficient operation and resource management on the Raspberry Pi 4. The core optimization principle is **resource gating** (activating high-power components only when necessary).
 
 Code Structure Breakdown:
-- Sensor Layer: `pir.py` (and the conceptual `ultra.py`) handles physical input via RPi.GPIO.
-- Core Logic Layer: `yuCapture.py` (Enrollment) and `yuAuth.py` (Authentication/Recognition) contain the CPU-intensive computer vision algorithms.
-- Integration Layer: The conceptual `sensorRecognize.py` acts as the master script, controlling the state of the Core Logic based on input from the Sensor Layer.
+- Sensor Layer: `ultra.py` and `pir.py` handle physical input via RPi.GPIO (Ultrasonic and PIR sensors).
+- Core Logic Layer: `enroll.py` (Enrollment) and `recognize.py` (Authentication) contain the CPU-intensive computer vision algorithms.
+- Integration Layer: `sensorRecognize.py` acts as the master script, controlling the state of the Core Logic based on input from the Sensor Layer.
 
 Models and Data:
-- Models: YuNet (`face_detection_yunet_2023mar.onnx`) for fast face detection, and ArcFace (`arcface_r100.onnx`) for feature embedding.
-- User Data: Stored in `data/users/{USERNAME}/embedding.npy` as L2-normalized mean feature vectors.
+- Models: YuNet (`face_detection_yunet_2023mar.onnx`) for face detection, and MobileFaceNet (`w600k_mbf.onnx`, part of `buffalo_sc`) for lightweight feature embedding.
+- User Data: Stored in `data/users/{USERNAME}/embeddings.npy` as a stacked matrix of feature vectors (not a single mean vector).
 
-2. Detailed Analysis of `yuCapture.py` (Enrollment Script - 'enroll.py')
+2. Detailed Analysis of `enroll.py` (Enrollment Script)
 
-The structure of `yuCapture.py` is designed to collect high-quality, diverse face samples and generate a stable biometric template.
+The structure of `enroll.py` uses a phased approach to capture a "manifold" of the user's face rather than a single snapshot.
 
 A. Configuration and Quality Control Utilities:
 - `TOTAL_SAMPLES = 40`: Specifies the required number of samples.
-- `MIN_FACE_SIZE = 90`: Rejects faces too small for robust feature extraction.
-- `BLUR_THRESHOLD = 70.0`: A key quality gate. The function `is_blurry(img)` calculates the variance of the Laplacian operator on the face image. Low variance (below 70.0) indicates blurriness, and the sample is rejected.
-- `SAMPLE_INTERVAL = 0.12`: Enforces temporal spacing between accepted samples to capture varied poses and lighting, making the final template more robust.
-- `def l2(v)`: Standard L2-normalization, ensuring all vectors have unit length for accurate cosine similarity.
+- `BLUR_THRESHOLD = 30.0`: A strict quality gate. The function `is_blurry(img)` rejects frames with low Laplacian variance.
+- `STARE_DURATION = 4.0`: Duration for the initial static capture phase.
+- `def l2_normalize(v)`: Standard L2-normalization for accurate cosine similarity.
 
-B. Initialization and Data Structures:
-- The script takes the username as input and creates the user directory.
-- `detector` (YuNet) and `embedder` (ArcFace) ONNX models are initialized first.
-- The camera is initialized with RPi-optimized settings: `CAP_V4L2`, 640x480 resolution, and 40 FPS.
-- The list `embeddings` is used to accumulate the L2-normalized feature vectors during the process.
+B. Enrollment Phases (State Machine):
+- **Phase 1: Countdown**: Gives the user 3 seconds to prepare.
+- **Phase 2: Stare**: Captures ~15 samples while the user looks straight at the camera. This establishes a strong baseline for frontal recognition.
+- **Phase 3: Rotate**: The user rotates their head. A **Diversity Check** is performed: if `sims.max() > 0.80` (current face is too similar to existing samples), the frame is rejected. This forces the collection of diverse angles.
 
-C. Sampling Loop and Feature Extraction:
-- Inside the `while len(embeddings) < TOTAL_SAMPLES:` loop:
-    - YuNet detects faces. The script only proceeds if a single face is found.
-    - An `if` statement checks the face quality: `if fw > MIN_FACE_SIZE and not is_blurry(face):`.
-    - A second `if` ensures temporal spacing: `if now - last_sample_time > SAMPLE_INTERVAL:`.
-    - The face is resized to ArcFace's required 112x112, converted to a blob, and fed into the `embedder`.
-    - The output vector (`vec`) is L2-normalized and appended to `embeddings`.
+C. Final Template Creation:
+- Unlike previous versions, this script **does not calculate a mean**.
+- It saves the raw stack of embeddings `np.stack(embeddings)` to `embeddings.npy`. This allows the recognition script to match against multiple specific angles rather than an averaged (and potentially blurry) representation.
 
-D. Final Template Creation:
-- After the loop terminates, the script calculates the template:
-  `mean_embedding = l2(np.mean(embeddings, axis=0))`
-- The **mean** of all 40 collected, normalized vectors is calculated, and then L2-normalized one final time. This averaging process creates the highly stable biometric template, which is saved as `embedding.npy`.
+3. Detailed Analysis of `recognize.py` (Authentication Script)
 
-3. Detailed Analysis of `yuAuth.py` (Authentication Script - 'recognize.py')
-
-The structure of `yuAuth.py` emphasizes speed and stability for real-time authentication.
+The structure of `recognize.py` emphasizes speed and stability, utilizing ONNX Runtime and matrix operations.
 
 A. Configuration and Utilities:
-- `THRESH = 0.6`: The minimum cosine similarity required for a potential match.
+- `THRESH = 0.65`: Stricter similarity threshold.
 - Temporal Voting:
-    - `VOTE_WINDOW = 6`: The size of the sliding window (the last 6 frames).
-    - `VOTE_PASS = 4`: The number of positive votes (similarity > THRESH) required within the window.
-- `def cosine(a, b)`: Implemented as `np.dot(a, b)`. Since all vectors are L2-normalized, the dot product directly yields the cosine similarity, streamlining the comparison.
+    - `VOTE_WINDOW = 10`: Larger window for stability.
+    - `VOTE_PASS = 6`: Requires 6 positive votes out of 10 to authenticate.
+- `SKIP_FRAMES = 2`: Processes only 1 out of every 3 frames to maintain UI responsiveness.
 
-B. Initialization and Pre-Loading:
-- All user templates (`embedding.npy`) are loaded into the `users` dictionary *before* the main loop begins. This prevents real-time disk I/O, which is critical for maintaining the 40 FPS target.
-- YuNet, ArcFace, and the camera are initialized similarly to `yuCapture.py`.
+B. Inference and Comparison:
+- **ONNX Runtime (ORT)**: The script attempts to use `onnxruntime` first for faster inference on the ARM CPU, falling back to `cv2.dnn` if unavailable.
+- **Matrix Multiplication**: Instead of a loop, it uses `sims = templates @ vec` to compare the live face against all 40 enrolled samples of a user simultaneously.
+- The maximum similarity score (`sims.max()`) determines the match quality.
 
-C. Main Recognition Loop:
-- A `deque` (double-ended queue) named `votes` with `maxlen=6` is initialized for the temporal check.
-- For each frame:
-    - A single face is detected, and its L2-normalized embedding (`vec`) is generated.
-    - The script iterates through the pre-loaded `users` database to find the `best_sim` using `cosine(vec, emb)`.
-    - **Temporal Voting Implementation**:
-        - `votes.append(best_sim > THRESH)`: The result of the frame's comparison is added to the queue.
-        - `if sum(votes) >= VOTE_PASS`: This check determines final authentication. If the sum of True values (1s) in the last 6 frames is 4 or more, the face is confirmed, preventing authentication based on single-frame errors or fleeting spoofing attempts.
+4. Detailed Analysis of `sensorRecognize.py` (Complete System Integration)
 
-4. Inferred Structure of `sensorRecognize.py` (Complete System Integration)
+The `sensorRecognize.py` script operates as a power-saving **state machine**, utilizing both PIR and Ultrasonic sensors to gate the camera.
 
-The `sensorRecognize.py` script must operate as a power-saving **state machine**, utilizing `pir.py`'s logic to control `yuAuth.py`'s resource consumption.
+A. Sensor Logic (SensorManager):
+- **Ultrasonic (TRIG=23, ECHO=24)**: Measures distance to the user.
+- **PIR (PIN=25)**: Detects infrared motion.
+- **Trigger Condition**: The system considers a person present ONLY if `distance <= 70.0` cm AND `motion` is detected.
 
-A. Overall Structure (State Machine Logic):
-1. Initialization:
-   - Initialize RPi.GPIO for the PIR sensor (`PIR_PIN`, GPIO 25).
-   - **CRITICAL:** The `cv2.VideoCapture` and model loading (YuNet, ArcFace) must be deferred.
+B. State Machine Structure:
+1. **IDLE State**:
+   - The camera is OFF. The system loops, polling the sensors every `0.1s`.
+   - If the trigger condition is met, it transitions to ACTIVE.
 
-2. IDLE State (Low Power Loop):
-   - The system is in a low-power state, running a tight loop that only polls the PIR sensor: `if GPIO.input(PIR_PIN):`.
-   - If motion is detected, the state transitions to ACTIVE.
+2. **ACTIVE State**:
+   - The camera initializes, and the face recognition loop (identical to `recognize.py`) begins.
+   - **Timeout Logic**: If the sensors report no person (`distance > 70cm` or no motion), an 8-second timer (`IDLE_TIMEOUT = 8.0`) starts.
+   - If the timer expires without the person returning, the camera is released (`cap.release()`), and the system returns to IDLE.
 
-3. ACTIVE State (Recognition Loop):
-   - Upon transition:
-     - Initialize `cv2.VideoCapture`.
-     - Load YuNet and ArcFace models (`cv2.FaceDetectorYN.create()`, `cv2.dnn.readNetFromONNX()`).
-     - Load user embeddings.
-   - Run the full `yuAuth.py` recognition loop, including temporal voting.
-   - Termination Condition: The script must monitor the PIR sensor or use a timer to detect if motion has ceased or if the system has been active too long.
-   - Upon meeting the termination condition:
-     - **CRITICAL Resource Release:** Call `cap.release()` and `cv2.destroyAllWindows()` to free up camera and memory resources.
-     - Transition back to the IDLE state.
-
-B. Optimization Summary:
-The structure avoids constant resource drain. By keeping the camera interface and the large ONNX models loaded only during the brief ACTIVE state, the system drastically reduces CPU load, power consumption, and heat generation, which is essential for stable, long-term operation on the Raspberry Pi 4.
+C. Optimization Summary:
+This structure ensures the heavy ONNX models and video capture threads are only active when a user is physically within interaction range, significantly reducing thermal load and power consumption on the Pi 4.
