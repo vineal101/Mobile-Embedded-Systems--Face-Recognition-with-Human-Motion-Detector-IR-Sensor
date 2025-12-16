@@ -1,85 +1,72 @@
-## Mobile Embedded Systems: Face Recognition with Human Motion Detector
+# Mobile Embedded Systems: Face Recognition with Human Motion Detector
 
-This project implements a resource-optimized face authentication system for the Raspberry Pi 4, utilizing a Passive Infrared (PIR) sensor and Ultrasonic sensor to trigger the face recognition pipeline.
+This project implements a resource-optimized face authentication system for the Raspberry Pi 4. It uses a multi-sensor array (PIR + Ultrasonic) to gate the power-intensive face recognition pipeline, ensuring the system runs efficiently.
 
 ## 1. System Overview
 
-The system is designed to minimize CPU and power consumption by only activating the camera and the computationally intensive face recognition models after the ultrasonic sensor detects an object that satisfies its threshold (70 cm) and when the PIR sensor detects human motion.
+The system is designed to minimize CPU and power consumption by only activating the camera and deep learning models when a user is physically close and moving.
 
 Key components:
-* **Face Detection:** YuNet ONNX model (`face_detection_yunet_2023mar.onnx`)
-* **Face Embedding:** ArcFace ONNX model (`arcface_r100.onnx`)
-* **User Data Storage:** Normalized feature vectors (`.npy` files)
-* **Optimization:** Specific camera settings (640x480, 40 FPS, CAP_V4L2) and motion gating for RPi 4.
+* **Face Detection:** YuNet ONNX model (`face_detection_yunet_2023mar.onnx`) running at reduced resolution (320x240).
+* **Face Embedding:** MobileFaceNet (`w600k_mbf.onnx`) from the [InsightFace buffalo_sc pack](https://github.com/deepinsight/insightface/tree/master/model_zoo). This model is highly optimized for ARM CPUs.
+* **User Data Storage:** A matrix of normalized feature vectors (`.npy` files) representing various angles of the user's face.
+* **Sensors:** HC-SR04 Ultrasonic Sensor (Distance) and HC-SR501 PIR Sensor (Motion).
 
 ## 2. Code Modules
 
-### 2.1. `yuCapture.py` (User Enrollment - `enroll.py`)
+### 2.1. `enroll.py` (User Enrollment)
 
-This script handles the process of enrolling a new user by generating a highly representative face embedding.
-
-| Configuration | Value | Purpose |
-| :--- | :--- | :--- |
-| `TOTAL_SAMPLES` | 40 | Number of face samples to collect. |
-| `MIN_FACE_SIZE` | 90 | Minimum required face size in pixels. |
-| `BLUR_THRESHOLD` | 70.0 | Minimum Laplacian variance for a non-blurry image. |
-
-**Process:**
-1.  Prompts for a `USERNAME` and creates the directory `data/users/{USERNAME}`.
-2.  Continuously captures frames, performs face detection (YuNet), and applies quality checks (size and blur).
-3.  If quality checks pass, the face is processed, and the ArcFace model generates an L2-normalized feature vector.
-4.  After collecting 40 samples, the script calculates a single **mean normalized embedding** from all vectors.
-5.  This mean vector is saved as `embedding.npy` in the user's directory for authentication.
-
-### 2.2. `yuAuth.py` (Face Authentication - `recognize.py`)
-
-This is the primary script for real-time face verification against the enrolled user database.
+Captures a robust dataset of the user's face to create a biometric template.
 
 | Configuration | Value | Purpose |
 | :--- | :--- | :--- |
-| `THRESH` | 0.6 | Cosine similarity score required for a match. |
-| `VOTE_WINDOW` | 6 | Number of recent frames used for temporal voting. |
-| `VOTE_PASS` | 4 | Number of positive votes required in the window for authentication. |
+| `TOTAL_SAMPLES` | 40 | Total embeddings to collect per user. |
+| `STARE_DURATION` | 4.0s | Time dedicated to frontal face capture. |
+| `BLUR_THRESHOLD` | 30.0 | Strict laplacian variance check to reject blurry frames. |
 
 **Process:**
-1.  All `embedding.npy` files from `data/users` are loaded into memory.
-2.  The script captures video, detects a face and generates a real-time embedding.
-3.  The embedding is compared to all loaded user embeddings using **Cosine Similarity**.
-    1. Cosine Similarity is a measure for how similar two matrices are by comparing the angles between their vector representations.
-4.  **Temporal Voting:** The match result (`similarity > THRESH`) is fed into a queue of size 6. Authentication is successful only if the count of positive matches reaches 4, ensuring stability and reducing false positives.
+1.  **Phase 1 (Stare):** Captures 15 samples of the user looking straight ahead.
+2.  **Phase 2 (Rotate):** The user rotates their head. The script performs a **Diversity Check** (`sims.max() > 0.80`), rejecting frames that are too similar to existing ones. This ensures the template covers the full 3D profile of the face.
+3.  **Storage:** Saves a stack of 40 embeddings (shape `40x512`) into `embeddings.npy`.
 
-### 2.3. `pir.py` (PIR Sensor Test)
+### 2.2. `recognize.py` (Face Authentication)
 
-The program used to verify the functionality of the Passive Infrared (PIR) motion sensor connected to the Raspberry Pi's GPIO pins.
+The core recognition script optimized for high FPS on the Pi 4.
 
-**Process:**
-1.  Sets GPIO mode to BCM and configures `PIR_PIN` (GPIO 25) as an input.
-2.  Loops to read the pin state, printing "Motion Detected!" or "No Motion" every 0.5 seconds.
-
-### 2.4. `ultra.py` (Ultrasonic and PIR Sensor Test)
-
-The program verifies the funtionalities of both the Passive Infrared (PIR) and ultrasonic sensor together, outputting relevant debug information.
+| Configuration | Value | Purpose |
+| :--- | :--- | :--- |
+| `THRESH` | 0.65 | Similarity threshold for a match. |
+| `SKIP_FRAMES` | 2 | Process 1 frame, skip 2 to save CPU. |
+| `DETECT_W/H` | 320x240 | Detection runs at low res for speed; alignment maps back to high res. |
 
 **Process:**
-1.  Sets the GPIO mode to BCM and configures relevant pins (`TRIG`, `ECHO`, `PIR_PIN`) as an input.
-2.  Loops to read the pin state, printing the distance measured by the ultrasonic sensor, whether the object satisfies the ultrasonic sensor's threshold, whether there is motion from the PIR sensor, and whether there is a person.
+1.  Loads `embeddings.npy` for all users into memory.
+2.  Captures video and detects faces using YuNet.
+3.  Aligns the face and extracts a 512-D vector using MobileFaceNet.
+4.  **Matrix Comparison:** Calculates the dot product between the live vector and *all* stored user vectors simultaneously (`templates @ vec`).
+5.  **Voting:** Uses a sliding window (size 10) to confirm identity. Requires 6 positive matches to authenticate.
 
-### 2.5. `sensorRecognize` (Complete Integration Script)
+### 2.3. `sensorRecognize.py` (Complete Integration)
 
-This script combines the motion detection and face authentication logic. Its primary goal is **resource optimization**. The face recognition camera and models remain inactive until motion is detected, significantly reducing CPU load and heat generation on the Raspberry Pi 4.
+The master script that integrates sensors with the recognition logic.
 
 **Workflow:**
-1.  Initialize GPIO, wait 2s for sensor stabilization, load user embeddings and models.
-2.  Loop: read sensors synchronously — ultrasonic distance first, then PIR — compute `person_present` = (distance <= 70 cm) AND motion.
-3.  If `person_present`: start the camera and enter the face-auth loop.
-4.  While camera is active: capture frames, detect/align faces, compute embeddings, compare to stored templates and use a short vote window to decide authentication success.
-5.  If sensors report no person, start an 8s timeout; on timeout stop the camera and return to idle.
-6.  Cleanup on exit.
+1.  **Sensor Polling:** Continuously reads the Ultrasonic and PIR sensors.
+2.  **Trigger Condition:** `person_present` is TRUE if:
+    * Distance is < 70cm (Ultrasonic)
+    * Motion is detected (PIR)
+3.  **Activation:** If triggered, the camera thread starts, and models are loaded (or utilized if pre-loaded).
+4.  **Timeout:** If the user leaves (sensors go low), an 8-second timer counts down. If no one returns, the camera is released to save power.
+
+### 2.4. Utility Scripts
+
+* **`ultra.py`**: A diagnostic tool that outputs raw data from the PIR and Ultrasonic sensors to help calibrate the distance threshold.
+* **`pir.py`**: A simple test script to verify GPIO connectivity for the PIR sensor.
 
 ## 3. Models and Data
 
-* **Models Directory (`models/`):** Contains the pre-trained neural network models for computer vision tasks.
-    * `face_detection_yunet_2023mar.onnx` (YuNet)
-    * `arcface_r100.onnx` (ArcFace)
-* **Data Directory (`data/users/`):** Stores all enrolled user data.
-    * `data/users/{USERNAME}/embedding.npy`: A single 512-dimensional, L2-normalized feature vector representing the mean face of the enrolled user.
+* **Models Directory (`models/`):**
+    * `face_detection_yunet_2023mar.onnx`: Lightweight face detector.
+    * `w600k_mbf.onnx`: MobileFaceNet (from `buffalo_sc`), optimized for edge devices.
+* **Data Directory (`data/users/`):**
+    * `{USERNAME}/embeddings.npy`: Contains the raw stack of feature vectors (not a mean vector), allowing for accurate multi-angle matching.
