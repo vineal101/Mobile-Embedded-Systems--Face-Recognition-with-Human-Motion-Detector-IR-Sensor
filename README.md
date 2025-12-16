@@ -1,10 +1,10 @@
 ## Mobile Embedded Systems: Face Recognition with Human Motion Detector
 
-This project implements a resource-optimized face authentication system for the Raspberry Pi 4, utilizing a Passive Infrared (PIR) sensor to trigger the face recognition pipeline.
+This project implements a resource-optimized face authentication system for the Raspberry Pi 4, utilizing a Passive Infrared (PIR) sensor and Ultrasonic sensor to trigger the face recognition pipeline.
 
 ## 1. System Overview
 
-The system is designed to minimize CPU and power consumption by only activating the camera and the computationally intensive face recognition models when the PIR sensor detects human motion.
+The system is designed to minimize CPU and power consumption by only activating the camera and the computationally intensive face recognition models after the ultrasonic sensor detects an object that satisfies its threshold (70 cm) and when the PIR sensor detects human motion.
 
 Key components:
 * **Face Detection:** YuNet ONNX model (`face_detection_yunet_2023mar.onnx`)
@@ -43,33 +43,38 @@ This is the primary script for real-time face verification against the enrolled 
 
 **Process:**
 1.  All `embedding.npy` files from `data/users` are loaded into memory.
-2.  The script captures video, detects a face (YuNet), and generates a real-time embedding (ArcFace).
+2.  The script captures video, detects a face and generates a real-time embedding.
 3.  The embedding is compared to all loaded user embeddings using **Cosine Similarity**.
+    1. Cosine Similarity is a measure for how similar two matrices are by comparing the angles between their vector representations.
 4.  **Temporal Voting:** The match result (`similarity > THRESH`) is fed into a queue of size 6. Authentication is successful only if the count of positive matches reaches 4, ensuring stability and reducing false positives.
 
 ### 2.3. `pir.py` (PIR Sensor Test)
 
-A utility to verify the functionality of the Passive Infrared (PIR) motion sensor connected to the Raspberry Pi's GPIO pins.
+The program used to verify the functionality of the Passive Infrared (PIR) motion sensor connected to the Raspberry Pi's GPIO pins.
 
 **Process:**
 1.  Sets GPIO mode to BCM and configures `PIR_PIN` (GPIO 25) as an input.
 2.  Loops to read the pin state, printing "Motion Detected!" or "No Motion" every 0.5 seconds.
 
-### 2.4. `sensorRecognize` (Complete Integration Script)
+### 2.4. `ultra.py` (Ultrasonic and PIR Sensor Test)
 
-*(This file was not provided, but its function is described based on system requirements.)*
+The program verifies the funtionalities of both the Passive Infrared (PIR) and ultrasonic sensor together, outputting relevant debug information.
+
+**Process:**
+1.  Sets the GPIO mode to BCM and configures relevant pins (`TRIG`, `ECHO`, `PIR_PIN`) as an input.
+2.  Loops to read the pin state, printing the distance measured by the ultrasonic sensor, whether the object satisfies the ultrasonic sensor's threshold, whether there is motion from the PIR sensor, and whether there is a person.
+
+### 2.5. `sensorRecognize` (Complete Integration Script)
 
 This script combines the motion detection and face authentication logic. Its primary goal is **resource optimization**. The face recognition camera and models remain inactive until motion is detected, significantly reducing CPU load and heat generation on the Raspberry Pi 4.
 
-**Expected Flow:**
-1.  Start by monitoring the PIR sensor (or a similar sensor like the one in `ultra.py`).
-2.  **IF Motion Detected:**
-    * Activate the camera.
-    * Begin the face authentication loop from `yuAuth.py`.
-3.  **IF Authentication Success:**
-    * Trigger an event (e.g., log access, open a relay).
-4.  **IF No Motion OR Timeout:**
-    * Deactivate the camera/recognition loop to return to a low-power state.
+**Workflow:**
+1.  Initialize GPIO, wait 2s for sensor stabilization, load user embeddings and models.
+2.  Loop: read sensors synchronously — ultrasonic distance first, then PIR — compute `person_present` = (distance <= 70 cm) AND motion.
+3.  If `person_present`: start the camera and enter the face-auth loop.
+4.  While camera is active: capture frames, detect/align faces, compute embeddings, compare to stored templates and use a short vote window to decide authentication success.
+5.  If sensors report no person, start an 8s timeout; on timeout stop the camera and return to idle.
+6.  Cleanup on exit.
 
 ## 3. Models and Data
 
@@ -78,4 +83,3 @@ This script combines the motion detection and face authentication logic. Its pri
     * `arcface_r100.onnx` (ArcFace)
 * **Data Directory (`data/users/`):** Stores all enrolled user data.
     * `data/users/{USERNAME}/embedding.npy`: A single 512-dimensional, L2-normalized feature vector representing the mean face of the enrolled user.
-* **Other Sensor Scripts:** `ultra.py` is mentioned for testing other sensors (likely an ultrasonic or proximity sensor) that can also be used to trigger the face recognition pipeline. Mobile-Embedded-Systems--Face-Recognition-with-Human-Motion-Detector-IR-Sensor
